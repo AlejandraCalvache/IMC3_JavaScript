@@ -1,0 +1,86 @@
+name: CI/CD Pipeline for IMC Calculator Web App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout del código
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # 2. Configurar Docker en GitHub Actions
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      # 3. Construir la imagen Docker localmente
+      - name: Build Docker image
+        run: |
+          docker build -t imc-calculator-app .
+
+      # 4. Guardar la imagen Docker y transferirla a EC2 usando SCP
+      - name: Save and transfer Docker image to EC2
+        run: |
+          # Guardar la imagen Docker y comprimirla
+          docker save imc-calculator-app | gzip > imc-calculator-app.tar.gz
+         
+          # Agregar la clave pública de EC2 al archivo known_hosts
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+         
+          # Transferir el archivo comprimido a EC2 usando SCP
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/ec2_key.pem
+          chmod 600 /tmp/ec2_key.pem
+          scp -i /tmp/ec2_key.pem imc-calculator-app.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/
+
+      # 5. Desplegar la aplicación en EC2 (Amazon Linux 2023)
+      - name: Deploy to EC2 (Amazon Linux 2023)
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/ec2_key.pem
+          chmod 600 /tmp/ec2_key.pem
+          ssh -o StrictHostKeyChecking=no -i /tmp/ec2_key.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            # Detectar si el sistema es Amazon Linux 2023
+            DISTRO=$(cat /etc/*release | grep -E 'Amazon Linux 2023' | head -n 1)
+           
+            # Si es Amazon Linux 2023
+            if [[ "$DISTRO" == *"Amazon Linux 2023"* ]]; then
+              echo "Instalando Docker en Amazon Linux 2023..."
+             
+              # Actualizar paquetes y sistema
+              sudo dnf update -y
+             
+              # Instalar Docker
+              sudo dnf install docker -y
+             
+              # Iniciar y habilitar el servicio Docker
+              sudo systemctl start docker
+              sudo systemctl enable docker
+             
+              # Agregar el usuario 'ec2-user' al grupo 'docker' para usar Docker sin sudo
+              sudo usermod -aG docker ec2-user
+              newgrp docker
+             
+              # Detener y eliminar la aplicación anterior (si existe)
+              sudo docker stop imc-calculator-app || true
+              sudo docker rm imc-calculator-app || true
+             
+              # Cargar la nueva imagen
+              sudo docker load < /tmp/imc-calculator-app.tar.gz
+             
+              # Ejecutar la nueva imagen
+              sudo docker run -d -p 80:80 --name imc-calculator-app imc-calculator-app
+            else
+              echo "El sistema no es Amazon Linux 2023."
+              exit 1
+            fi
+          EOF
+
+      # 6. Limpiar la clave SSH después de la transferencia y despliegue
+      - name: Clean up SSH key
+        run: |
+          rm /tmp/ec2_key.pem
